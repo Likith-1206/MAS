@@ -107,4 +107,4 @@ def mix_rewards(env, r, beta):
     """Cooperative reward shaping: own reward + beta * mean reward of neighbours (penalises pushing queues onto neighbours)."""
     if beta == 0:
         return r
-    return {a: r[a] + beta * float(np.mean([r[n] for n in env.neighbors[a]])) for a in env.agents}
+    return {a: r[a] + beta * float(np.mean([r[n] for n in env.neighbors[a] if n])) for a in env.agents}
