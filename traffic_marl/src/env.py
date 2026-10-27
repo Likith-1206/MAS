@@ -6,7 +6,11 @@ Reward  : negative total queue on the intersection's incoming lanes (scaled).
 """
 import os, sys, tempfile
 import numpy as np
-os.environ.setdefault("SUMO_HOME", "/usr/local/lib/python3.12/dist-packages/sumo")
+try:                                    # find SUMO inside whichever Python is running (pip install eclipse-sumo)
+    import sumo as _sumo
+    os.environ.setdefault("SUMO_HOME", _sumo.SUMO_HOME)
+except ImportError:
+    pass
 import libsumo as traci
 import sumolib
 
@@ -30,6 +34,8 @@ class SumoGridEnv:
         self._static()
         self.n_act = len(self.green[self.agents[0]])
         self.obs_dim = len(self._dummy_obs())
+        self.obs_names = self._make_obs_names()
+        assert len(self.obs_names) == self.obs_dim
 
     # ---------- static topology ----------
     def _dir_of(self, node, other):
@@ -50,7 +56,7 @@ class SumoGridEnv:
                 fid = e.getFromNode().getID()
                 slots[d] = fid if fid in self.agents else None
             self.neighbor_slot[a] = slots
-            self.neighbors[a] = [x for x in slots if x]
+            self.neighbors[a] = slots                      # [N, E, S, W], each an agent id or None
         # SUMO-dependent info, needs a running simulation once
         cfg = self._write_cfg("uniform", 0)
         traci.start(["sumo", "-c", cfg, "--no-warnings", "true", "--no-step-log", "true"])
@@ -75,6 +81,18 @@ class SumoGridEnv:
         assert len({tuple(v) for v in sig.values()}) == 1, f"phase semantics differ across agents: {sig}"
         self.phase_dirs = sig[self.agents[0]]
 
+    def _make_obs_names(self):
+        a = self.agents[0]
+        lane_names = [f"{DIRS[self.edge_dir[l.rsplit('_', 1)[0]]]}_lane{l.rsplit('_', 1)[1]}" for l in self.lanes[a]]
+        names = [f"{n}_waiting" for n in lane_names] + [f"{n}_cars" for n in lane_names]
+        names += [f"phase{p}_green" for p in range(self.n_act)] + ["time_since_change"]
+        if self.comm_level >= 1:
+            for d in DIRS:
+                names.append(f"nb_{d}_queue")
+                if self.comm_level >= 2:
+                    names += [f"nb_{d}_phase{p}" for p in range(self.n_act)]
+        return names
+
     def _write_cfg(self, scn, seed):
         rou = os.path.join(self.tmp, f"{scn}.rou.xml")
         if not os.path.exists(rou):
@@ -86,12 +104,15 @@ class SumoGridEnv:
         return cfg
 
     # ---------- episode control ----------
-    def reset(self, scenario="uniform", seed=0):
+    def reset(self, scenario="uniform", seed=0, tripinfo_file=None):
         if self.running:
             traci.close()
         cfg = self._write_cfg(scenario, seed)
-        traci.start(["sumo", "-c", cfg, "--no-warnings", "true", "--no-step-log", "true", "--seed", str(seed),
-                     "--time-to-teleport", "-1"])
+        args = ["sumo", "-c", cfg, "--no-warnings", "true", "--no-step-log", "true", "--seed", str(seed),
+                "--time-to-teleport", "-1"]
+        if tripinfo_file:                              # optional: SUMO's own trip output, for metric checks
+            args += ["--tripinfo-output", tripinfo_file]
+        traci.start(args)
         self.running = True
         self.t = 0
         self.cur = {a: 0 for a in self.agents}
@@ -145,7 +166,20 @@ class SumoGridEnv:
         self.m["maxq"] = max(self.m["maxq"], max(h.max() for h in halt.values()))
         rewards = {a: -halt[a].sum() / 10.0 for a in self.agents}
         done = self.t >= S.EPISODE_LEN
-        return self._obs(), rewards, done, {"queue": {a: float(halt[a].sum()) for a in self.agents}}
+        tot_cars, acc_wait = {}, {}
+        for a in self.agents:
+            tot_cars[a] = int(sum(traci.lane.getLastStepVehicleNumber(l) for l in self.lanes[a]))
+            acc_wait[a] = float(sum(traci.vehicle.getAccumulatedWaitingTime(v)
+                                    for l in self.lanes[a] for v in traci.lane.getLastStepVehicleIDs(l)))
+        queue = {a: float(halt[a].sum()) for a in self.agents}
+        info = {"queue": queue,                         # used by the dashboard traces
+                "waiting_cars": dict(queue),            # raw values, so other rewards can be tried
+                "total_cars": tot_cars,
+                "acc_wait_s": acc_wait,                 # SUMO accumulated waiting time of cars on incoming lanes
+                "phase": dict(self.cur),
+                "yellow": {a: a in sw for a in self.agents},   # True if a 2 s yellow was inserted this step
+                "time": self.t}
+        return self._obs(), rewards, done, info
 
     # ---------- observations ----------
     def _halting(self, a):
