@@ -1,0 +1,35 @@
+{
+  "method": "coop",
+  "seed": 1,
+  "episodes": 120,
+  "agent": "shared",
+  "comm_level": 2,
+  "reward_mix_beta": 0.5,
+  "eps_start": 0.6,
+  "eps_end": 0.05,
+  "eps_decay_frac": 0.6,
+  "learn_steps_per_decision": 1,
+  "train_seed_formula": "1000*seed+episode",
+  "eval_seeds": [
+    9001,
+    9002,
+    9003
+  ],
+  "scenarios": [
+    "uniform",
+    "asymmetric",
+    "rush_hour",
+    "corridor"
+  ],
+  "lr": 0.001,
+  "gamma": 0.9,
+  "batch": 128,
+  "target_every": 100,
+  "min_buf": 500,
+  "replay_cap": 30000,
+  "hidden": 64,
+  "obs_dim": 31,
+  "git_commit": "7fd5849",
+  "train_seconds": 172,
+  "finished": "2026-10-27T13:59:24"
+}
