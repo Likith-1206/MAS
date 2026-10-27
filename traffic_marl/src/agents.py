@@ -1,6 +1,7 @@
 """DQN agents (PyTorch): independent (one network per intersection) and shared-weight (parameter sharing)."""
 import numpy as np
 import torch, torch.nn as nn
+from neighbors import augment, extra_dim
 torch.set_num_threads(1)
 
 
@@ -79,12 +80,17 @@ class IndependentDQN:
 
 
 class SharedDQN:
-    """Parameter sharing: one network for all intersections (same input semantics), trained on pooled experience."""
-    def __init__(self, env, batch=128):
-        self.ag = env.agents
-        self.net = DQN(env.obs_dim, env.n_act, batch=batch)
+    """Parameter sharing: one network for all intersections, trained on pooled experience.
+    `level` (0/1/2) = how much neighbour information is appended to the observation (see neighbors.py).
+    act/store take the RAW level-0 observations from the env; the augmentation happens inside the agent,
+    so the evaluation function can use this agent without knowing about communication."""
+    def __init__(self, env, level=0, batch=128):
+        self.ag, self.nbrs, self.level = env.agents, env.neighbors, level
+        self.obs_dim = env.obs_dim + extra_dim(level)
+        self.net = DQN(self.obs_dim, env.n_act, batch=batch)
 
     def act(self, obs, eps):
+        obs = augment(obs, self.nbrs, self.level)
         M = np.stack([obs[a] for a in self.ag])
         acts = self.net.act(M, -1)
         if eps > 0:
@@ -93,6 +99,7 @@ class SharedDQN:
         return {a: int(acts[i]) for i, a in enumerate(self.ag)}
 
     def store(self, o, act, r, o2, done):
+        o, o2 = augment(o, self.nbrs, self.level), augment(o2, self.nbrs, self.level)
         self.net.buf.add_many([o[a] for a in self.ag], [act[a] for a in self.ag], [r[a] for a in self.ag],
                               [o2[a] for a in self.ag], float(done))
 
