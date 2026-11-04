@@ -1,7 +1,7 @@
 {
   "method": "mappo",
   "seed": 1,
-  "episodes": 100,
+  "episodes": 300,
   "comm_level": 0,
   "reward_mix_beta": 0.0,
   "train_seed_formula": "1000*seed+episode",
@@ -28,7 +28,7 @@
   "hidden": 64,
   "actor_obs_dim": 19,
   "critic_state_dim": 180,
-  "git_commit": "4009eb8",
-  "train_seconds": 879,
-  "finished": "2026-11-03T17:45:56"
+  "git_commit": "564c4d6",
+  "train_seconds": 3539,
+  "finished": "2026-11-04T00:00:48"
 }
