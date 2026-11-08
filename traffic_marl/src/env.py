@@ -11,7 +11,12 @@ try:                                    # find SUMO inside whichever Python is r
     os.environ.setdefault("SUMO_HOME", _sumo.SUMO_HOME)
 except ImportError:
     pass
-import libsumo as traci
+if os.environ.get("SUMO_GUI") == "1":
+    import traci
+    SUMO_BIN = "sumo-gui"
+else:
+    import libsumo as traci
+    SUMO_BIN = "sumo"
 import sumolib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -108,8 +113,10 @@ class SumoGridEnv:
         if self.running:
             traci.close()
         cfg = self._write_cfg(scenario, seed)
-        args = ["sumo", "-c", cfg, "--no-warnings", "true", "--no-step-log", "true", "--seed", str(seed),
+        args = [SUMO_BIN, "-c", cfg, "--no-warnings", "true", "--no-step-log", "true", "--seed", str(seed),
                 "--time-to-teleport", "-1"]
+        if SUMO_BIN == "sumo-gui":
+            args += ["--start", "--delay", os.environ.get("SUMO_GUI_DELAY", "100")]
         if tripinfo_file:                              # optional: SUMO's own trip output, for metric checks
             args += ["--tripinfo-output", tripinfo_file]
         traci.start(args)
