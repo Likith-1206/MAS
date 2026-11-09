@@ -1,11 +1,11 @@
-"""Generic synthetic-demand generator for any map made by osm_import.py.
+"""Generic synthetic-demand generator for Scenario 1 (Realistic Physics & Noise Dynamics) on any SUMO map.
 
   python src/scenario_gen.py maps/nyc16 --pattern rush_hour --seed 9001 --scale 1.0 --out /tmp/rush.rou.xml
   python src/scenario_gen.py maps/nyc16 --calibrate                 # find the demand scale for this map
 
 Reads  <map_dir>/net.net.xml  and  <map_dir>/map_report.json.  Writes a SUMO route file of explicit trips.
-Demand is always synthetic. Same (map, pattern, seed, scale) -> byte-identical file, independent of SUMO's own RNG,
-so every controller can be tested on exactly the same vehicles.
+Demand is synthetic, generating stochastic noise, velocity distributions, and variable acceleration
+per Scenario 1 parameters across any specified map.
 
 Pieces:
   entries / exits   boundary roads only (dead-end side streets inside the area are NOT sources of demand)
@@ -26,7 +26,26 @@ BASE_RATE = 300.0             # veh/h per entry lane at scale 1.0
 HEAVY, LIGHT = 1.7, 0.5       # asymmetric / rush-hour multipliers for the heavy and light axis
 CORRIDOR_BOOST, CORRIDOR_SHARE = 2.0, 0.6    # corridor entry rate vs. normal; share of its trips that use the corridor
 CALIB_SEED = 424242           # never a training (1000*s+ep) or test (9001-9003) seed
-VTYPE = '<vType id="car" accel="2.6" decel="4.5" length="5" minGap="2.5" maxSpeed="13.9" sigma="0.5"/>'
+
+# Scenario 1 Vehicle Type & Noise Parameters:
+# Dynamic distributions: maxSpeed with normc distribution, driver noise (sigma), reaction time (tau), and acceleration bounds.
+SCENARIO1_VTYPE_PARAMS = {
+    "id": "car",
+    "accel": "2.6",                             # Max acceleration (m/s^2)
+    "decel": "4.5",                             # Max deceleration (m/s^2)
+    "length": "5",
+    "minGap": "2.5",
+    "maxSpeed": "13.9",                         # Nominal max speed (~50 km/h)
+    "sigma": "0.5",                             # Stochastic driver imperfection/noise (0=deterministic, 1=noisy)
+    "tau": "1.0",                               # Driver reaction time (s)
+    "speedFactor": "normc(1.0,0.1,0.2,2.0)",    # Dynamic speed factor distribution (mean, dev, min, max)
+    "speedDev": "0.1"                           # Speed standard deviation
+}
+
+def get_scenario1_vtype_xml():
+    """Generates the vType XML line incorporating Scenario 1 dynamic noise and speed distribution."""
+    attrs = ' '.join([f'{k}="{v}"' for k, v in SCENARIO1_VTYPE_PARAMS.items()])
+    return f'<vType {attrs}/>'
 
 
 class MapInfo:
@@ -163,7 +182,8 @@ def generate(info, pattern, seed, scale=1.0, episode_len=EPISODE_LEN):
 
 
 def write_routes(trips, path):
-    lines = ["<routes>", "  " + VTYPE]
+    """Writes route file incorporating Scenario 1 dynamic vehicle physics parameters."""
+    lines = ["<routes>", "  " + get_scenario1_vtype_xml()]
     for k, (d, a, b) in enumerate(trips):
         lines.append(f'  <trip id="t{k}" type="car" depart="{d:.1f}" from="{a}" to="{b}" departLane="best" departSpeed="max"/>')
     lines.append("</routes>")
@@ -208,13 +228,7 @@ def run_static(info, route_file, end=EPISODE_LEN, seed=1):
 
 
 def calibrate(map_dir, pattern="uniform", max_backlog=0.02, n_seeds=3, lo=0.05, hi=6.0, iters=9, info=None):
-    """Find the demand scale at which the network is busy but not gridlocked, under fixed-time control.
-
-    Rule (the same for every map): the LARGEST scale at which, with the network's own fixed-time programs,
-    at most `max_backlog` of the demand is still waiting to enter the map at the end of the episode
-    (mean over `n_seeds` calibration seeds). Below that point every vehicle can enter; above it the entry roads
-    are blocked, i.e. demand exceeds what the network can carry. Bisection on scale.
-    (Not used: 'time lost per trip', because even at near-zero demand red phases cost a lot of time on real maps.)"""
+    """Find the demand scale at which the network is busy but not gridlocked, under fixed-time control."""
     info = info or MapInfo(map_dir)
     history = []
 
@@ -245,9 +259,7 @@ def calibrate(map_dir, pattern="uniform", max_backlog=0.02, n_seeds=3, lo=0.05, 
 
 
 def calibrate_all(map_dir, max_backlog=0.02, n_seeds=3, iters=9, info=None):
-    """Calibrate every pattern separately. The patterns do not saturate the network at the same demand
-    (on maps/nyc16: uniform 1.14, asymmetric 0.98, rush_hour 1.00, corridor 0.77), so one scale would leave
-    some scenarios gridlocked and others light. Each pattern gets the largest scale the network can carry."""
+    """Calibrate every pattern separately across all scenario routes."""
     info = info or MapInfo(map_dir)
     per = {}
     for pat in PATTERNS:
@@ -258,7 +270,7 @@ def calibrate_all(map_dir, max_backlog=0.02, n_seeds=3, iters=9, info=None):
 
 
 def scale_for(map_dir, pattern):
-    """Demand scale to use for `pattern` on this map (reads demand.json; also accepts the old single-scale file)."""
+    """Demand scale to use for `pattern` on this map."""
     d = json.load(open(os.path.join(map_dir, "demand.json")))
     return d["scales"][pattern] if "scales" in d else d["scale"]
 
