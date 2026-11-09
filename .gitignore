@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 traffic_marl/mas/
+*.osm
+traffic_marl/maps/area1/
+traffic_marl/maps/full/

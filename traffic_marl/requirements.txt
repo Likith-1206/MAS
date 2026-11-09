@@ -10,3 +10,4 @@ matplotlib
 plotly
 streamlit>=1.50
 networkx
+pyproj
