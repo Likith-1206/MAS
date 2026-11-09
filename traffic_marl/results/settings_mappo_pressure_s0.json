@@ -1,0 +1,40 @@
+{
+  "method": "mappo_pressure",
+  "reward_mode": "pressure_delta",
+  "seed": 0,
+  "episodes": 100,
+  "communication_level": 0,
+  "training_seed_formula": "1000*seed+episode",
+  "evaluation_seeds": [
+    9001,
+    9002,
+    9003
+  ],
+  "scenarios": [
+    "uniform",
+    "asymmetric",
+    "rush_hour",
+    "corridor"
+  ],
+  "map": "maps/nyc16",
+  "number_of_agents": 15,
+  "algo": "MAPPO",
+  "max_incoming_lanes": 10,
+  "number_of_phases": 3,
+  "lr_actor": 0.0003,
+  "lr_critic": 0.001,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "clip": 0.2,
+  "ppo_epochs": 4,
+  "minibatch": 256,
+  "ent_coef": 0.01,
+  "hidden": 64,
+  "base_obs_dim": 34,
+  "actor_obs_dim": 34,
+  "critic_state_dim": 525,
+  "git_commit": "05bbb0f",
+  "train_seconds": 5496,
+  "evaluation_skipped": false,
+  "finished": "2026-11-09T13:48:08"
+}
