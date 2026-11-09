@@ -1,17 +1,12 @@
-"""Generic synthetic-demand generator for Scenario 1 (Realistic Physics & Noise Dynamics) on any SUMO map.
+"""Generic synthetic-demand generator for Scenario 2 (Non-Stationary Dynamic Flows & Stochastic Arrivals) on any SUMO map.
 
-  python src/scenario_gen.py maps/nyc16 --pattern rush_hour --seed 9001 --scale 1.0 --out /tmp/rush.rou.xml
-  python src/scenario_gen.py maps/nyc16 --calibrate                 # find the demand scale for this map
+  python traffic_marl/src/scenario_gen.py traffic_marl/maps/nyc16 --pattern rush_hour --seed 9001 --scale 1.0 --out test_s2.rou.xml
+  python traffic_marl/src/scenario_gen.py traffic_marl/maps/nyc16 --calibrate-all
 
-Reads  <map_dir>/net.net.xml  and  <map_dir>/map_report.json.  Writes a SUMO route file of explicit trips.
-Demand is synthetic, generating stochastic noise, velocity distributions, and variable acceleration
-per Scenario 1 parameters across any specified map.
-
-Pieces:
-  entries / exits   boundary roads only (dead-end side streets inside the area are NOT sources of demand)
-  routes            only entry->exit pairs that have a path through at least one controllable light
-  patterns          uniform | asymmetric | rush_hour | corridor   (defined by travel direction, not by names)
-  rate              veh/h per entry lane x number of lanes x scale; `scale` is found by calibrate()
+Scenario 2 Extensions:
+  - Non-stationary arrival rate modeling lambda(t) via time-segmented Poisson processes.
+  - Multi-pattern flow dynamics: uniform, asymmetric, rush_hour, and corridor.
+  - Retains Scenario 1 vehicle physics (accel, decel, sigma driver noise, speed factor distributions).
 """
 import argparse, json, math, os, subprocess, sys, tempfile
 import xml.etree.ElementTree as ET
@@ -27,24 +22,23 @@ HEAVY, LIGHT = 1.7, 0.5       # asymmetric / rush-hour multipliers for the heavy
 CORRIDOR_BOOST, CORRIDOR_SHARE = 2.0, 0.6    # corridor entry rate vs. normal; share of its trips that use the corridor
 CALIB_SEED = 424242           # never a training (1000*s+ep) or test (9001-9003) seed
 
-# Scenario 1 Vehicle Type & Noise Parameters:
-# Dynamic distributions: maxSpeed with normc distribution, driver noise (sigma), reaction time (tau), and acceleration bounds.
-SCENARIO1_VTYPE_PARAMS = {
+# Scenario 1 + Scenario 2 Vehicle Type Parameters
+SCENARIO2_VTYPE_PARAMS = {
     "id": "car",
     "accel": "2.6",                             # Max acceleration (m/s^2)
     "decel": "4.5",                             # Max deceleration (m/s^2)
     "length": "5",
     "minGap": "2.5",
     "maxSpeed": "13.9",                         # Nominal max speed (~50 km/h)
-    "sigma": "0.5",                             # Stochastic driver imperfection/noise (0=deterministic, 1=noisy)
-    "tau": "1.0",                               # Driver reaction time (s)
-    "speedFactor": "normc(1.0,0.1,0.2,2.0)",    # Dynamic speed factor distribution (mean, dev, min, max)
-    "speedDev": "0.1"                           # Speed standard deviation
+    "sigma": "0.5",                             # Driver imperfection / stochastic noise (Scenario 1)
+    "tau": "1.0",                               # Reaction time (s)
+    "speedFactor": "normc(1.0,0.1,0.2,2.0)",    # Speed factor distribution
+    "speedDev": "0.1"                           # Speed deviation
 }
 
-def get_scenario1_vtype_xml():
-    """Generates the vType XML line incorporating Scenario 1 dynamic noise and speed distribution."""
-    attrs = ' '.join([f'{k}="{v}"' for k, v in SCENARIO1_VTYPE_PARAMS.items()])
+def get_scenario2_vtype_xml():
+    """Generates the vType XML line incorporating vehicle dynamics and noise."""
+    attrs = ' '.join([f'{k}="{v}"' for k, v in SCENARIO2_VTYPE_PARAMS.items()])
     return f'<vType {attrs}/>'
 
 
@@ -54,16 +48,15 @@ class MapInfo:
     def __init__(self, map_dir, margin_m=None):
         self.dir = map_dir
         self.report = json.load(open(os.path.join(map_dir, "map_report.json")))
-        self.net_file = os.path.join(map_dir, "net.net.xml")              # relative to the map folder: portable
+        self.net_file = os.path.join(map_dir, "net.net.xml")
         self.net = sumolib.net.readNet(self.net_file)
         (x0, y0), (x1, y1) = self.net.getBoundary()[:2], self.net.getBoundary()[2:]
         self.box = (x0, y0, x1, y1)
         self.margin = margin_m if margin_m is not None else max(60.0, 0.1 * min(x1 - x0, y1 - y0))
-        # edges that approach a controllable light: a route is only useful if it crosses one
         self.ctrl_edges = {e for t in self.report["traffic_lights"] if t["controllable"] for e in t["approaches"]}
         self.entries = [e for e in self.report["entry_edges"] if self._near_boundary(self.net.getEdge(e).getFromNode())]
         self.exits = [e for e in self.report["exit_edges"] if self._near_boundary(self.net.getEdge(e).getToNode())]
-        self.od, self.od_ctrl = self._valid_pairs()          # od[entry] = [exit, ...]; od_ctrl[(entry, exit)] = lights on path
+        self.od, self.od_ctrl = self._valid_pairs()
 
     def _near_boundary(self, node):
         x, y = node.getCoord()
@@ -77,7 +70,7 @@ class MapInfo:
             for eout in self.exits:
                 b = self.net.getEdge(eout)
                 if ein == eout or (b.getFromNode() == a.getToNode() and b.getToNode() == a.getFromNode()):
-                    continue                                              # no U-turn at the boundary
+                    continue
                 path, _ = self.net.getShortestPath(a, b, vClass="passenger")
                 if not path:
                     continue
@@ -113,18 +106,18 @@ def _axis(h):
 
 
 def _corridor_pair(info):
-    """The entry/exit pair whose path crosses the most controllable lights (longest on ties): the demand corridor."""
     return max(info.od_ctrl, key=lambda k: (info.od_ctrl[k], k))
 
 
 def _multiplier(info, pattern, entry, t0):
+    """Scenario 2 Dynamic Non-Stationary Temporal Multiplier lambda(t)."""
     ax = _axis(info.heading(entry))
     axes = {_axis(info.heading(e)) for e in info.sources()}
     if len(axes) < 2 or pattern in ("uniform", "corridor"):
-        return 1.0 if pattern != "corridor" else 0.6          # corridor: weak background everywhere
+        return 1.0 if pattern != "corridor" else 0.6
     if pattern == "asymmetric":
         return HEAVY if ax == "EW" else LIGHT
-    if pattern == "rush_hour":                                # NS-heavy -> balanced -> EW-heavy
+    if pattern == "rush_hour":                                # Non-stationary progression: NS -> Balanced -> EW
         phase = min(2, int(3 * t0 / EPISODE_LEN))
         if phase == 1:
             return 1.0
@@ -138,7 +131,6 @@ def _segments(pattern, episode_len):
 
 
 def _raw_rates(info, pattern, scale, t0, cor):
-    """veh/s entering at each source entry in the time segment starting at t0 (before normalisation)."""
     rates = {}
     for ein in info.sources():
         m = CORRIDOR_BOOST if (cor and ein == cor[0]) else _multiplier(info, pattern, ein, t0)
@@ -152,9 +144,7 @@ def _expected_total(info, pattern, scale, episode_len):
 
 
 def generate(info, pattern, seed, scale=1.0, episode_len=EPISODE_LEN):
-    """Return (list of (depart_s, entry, exit), stats). Deterministic in (pattern, seed, scale).
-    Every pattern is normalised to the same EXPECTED number of vehicles as 'uniform' at the same scale: a pattern
-    changes where and when the traffic goes, never how much there is, so one calibrated scale fits all patterns."""
+    """Scenario 2 Non-Stationary Poisson Arrival Generation."""
     if pattern not in PATTERNS:
         raise ValueError(f"unknown pattern {pattern!r}; choose from {PATTERNS}")
     if not info.od:
@@ -168,11 +158,12 @@ def generate(info, pattern, seed, scale=1.0, episode_len=EPISODE_LEN):
             rate *= norm
             dests = info.od[ein]
             w = np.ones(len(dests))
-            if cor and ein == cor[0] and len(dests) > 1:                  # most of the corridor entry's traffic goes the long way
+            if cor and ein == cor[0] and len(dests) > 1:
                 w = np.where(np.array(dests) == cor[1], 0.0, 1.0)
                 w = w / w.sum() * (1 - CORRIDOR_SHARE)
                 w[dests.index(cor[1])] = CORRIDOR_SHARE
             w = w / w.sum()
+            # Non-stationary Poisson arrival count per interval
             n = rng.poisson(rate * (t1 - t0))
             for d in np.sort(rng.uniform(t0, t1, n)):
                 trips.append((round(float(d), 1), ein, dests[rng.choice(len(dests), p=w)]))
@@ -182,8 +173,7 @@ def generate(info, pattern, seed, scale=1.0, episode_len=EPISODE_LEN):
 
 
 def write_routes(trips, path):
-    """Writes route file incorporating Scenario 1 dynamic vehicle physics parameters."""
-    lines = ["<routes>", "  " + get_scenario1_vtype_xml()]
+    lines = ["<routes>", "  " + get_scenario2_vtype_xml()]
     for k, (d, a, b) in enumerate(trips):
         lines.append(f'  <trip id="t{k}" type="car" depart="{d:.1f}" from="{a}" to="{b}" departLane="best" departSpeed="max"/>')
     lines.append("</routes>")
@@ -199,7 +189,6 @@ def build_route_file(map_dir, pattern, seed, path, scale=1.0, info=None):
     return st
 
 
-# ---------------------------------------------------------------- calibration
 def _find_sumo():
     import shutil
     exe = shutil.which("sumo")
@@ -210,7 +199,6 @@ def _find_sumo():
 
 
 def run_static(info, route_file, end=EPISODE_LEN, seed=1):
-    """Run SUMO with the network's own fixed-time programs; return its statistics (no TraCI, no agents)."""
     with tempfile.TemporaryDirectory() as d:
         stat = os.path.join(d, "stat.xml")
         r = subprocess.run([_find_sumo(), "-n", info.net_file, "-r", route_file, "--end", str(end), "--seed", str(seed),
@@ -228,7 +216,6 @@ def run_static(info, route_file, end=EPISODE_LEN, seed=1):
 
 
 def calibrate(map_dir, pattern="uniform", max_backlog=0.02, n_seeds=3, lo=0.05, hi=6.0, iters=9, info=None):
-    """Find the demand scale at which the network is busy but not gridlocked, under fixed-time control."""
     info = info or MapInfo(map_dir)
     history = []
 
@@ -245,7 +232,7 @@ def calibrate(map_dir, pattern="uniform", max_backlog=0.02, n_seeds=3, lo=0.05, 
 
     ok = lambda s: measure(s)["backlog_frac"] <= max_backlog
     if not ok(lo):
-        return dict(scale=lo, ok=False, note="entries are blocked even at the lowest demand: check the map", history=history)
+        return dict(scale=lo, ok=False, note="entries are blocked even at lowest demand", history=history)
     if ok(hi):
         return dict(scale=hi, ok=True, note="demand cap reached without saturation", history=history)
     a, b = lo, hi
@@ -259,7 +246,6 @@ def calibrate(map_dir, pattern="uniform", max_backlog=0.02, n_seeds=3, lo=0.05, 
 
 
 def calibrate_all(map_dir, max_backlog=0.02, n_seeds=3, iters=9, info=None):
-    """Calibrate every pattern separately across all scenario routes."""
     info = info or MapInfo(map_dir)
     per = {}
     for pat in PATTERNS:
@@ -270,7 +256,6 @@ def calibrate_all(map_dir, max_backlog=0.02, n_seeds=3, iters=9, info=None):
 
 
 def scale_for(map_dir, pattern):
-    """Demand scale to use for `pattern` on this map."""
     d = json.load(open(os.path.join(map_dir, "demand.json")))
     return d["scales"][pattern] if "scales" in d else d["scale"]
 
@@ -278,26 +263,22 @@ def scale_for(map_dir, pattern):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("map_dir")
-    ap.add_argument("--pattern", default="uniform", choices=PATTERNS)
+    ap.add_argument("--pattern", default="rush_hour", choices=PATTERNS)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--scale", type=float, default=1.0)
     ap.add_argument("--out", help="route file to write")
-    ap.add_argument("--calibrate", action="store_true", help="find the demand scale for this map and write it to <map_dir>/demand.json")
-    ap.add_argument("--calibrate-all", action="store_true", help="calibrate all four patterns separately; writes a scale per pattern to <map_dir>/demand.json")
-    ap.add_argument("--max-backlog", type=float, default=0.02, help="calibration: allowed share of demand still waiting to enter")
-    ap.add_argument("--margin", type=float, help="metres from the map edge that count as 'boundary' (default max(60, 10%% of size))")
+    ap.add_argument("--calibrate", action="store_true")
+    ap.add_argument("--calibrate-all", action="store_true")
+    ap.add_argument("--max-backlog", type=float, default=0.02)
+    ap.add_argument("--margin", type=float)
     a = ap.parse_args()
     info = MapInfo(a.map_dir, a.margin)
     print(json.dumps(info.describe(), indent=1))
     if a.calibrate:
         res = calibrate(a.map_dir, a.pattern, a.max_backlog, info=info)
-        for h in res["history"]:
-            print(h)
-        print({k: v for k, v in res.items() if k != "history"})
         json.dump({k: v for k, v in res.items() if k != "history"}, open(os.path.join(a.map_dir, "demand.json"), "w"), indent=1)
     if a.calibrate_all:
         res = calibrate_all(a.map_dir, a.max_backlog, info=info)
-        print(json.dumps(res, indent=1))
         json.dump(res, open(os.path.join(a.map_dir, "demand.json"), "w"), indent=1)
     if a.out:
         print(build_route_file(a.map_dir, a.pattern, a.seed, a.out, a.scale, info))
