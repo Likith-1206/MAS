@@ -1,65 +1,347 @@
-"""Train + evaluate MAPPO on the same env, scenarios, seeds and metrics as the DQN methods.
+"""Train and evaluate MAPPO on the NYC traffic-signal map.
 
-  python src/run_mappo.py --episodes 100 --seed 0                 # shared actor, own obs only (level 0)
-  python src/run_mappo.py --episodes 100 --seed 0 --level 2 --beta 0.5   # + neighbour info and reward mixing (like `coop`)
-
-Outputs (same naming scheme as run_experiments.py): results/curve_<tag>.csv, results/eval_<tag>.csv,
-results/settings_<tag>.json, models/<tag>.pt, traces/<tag>.json  with tag = mappo[_c<level>]_s<seed>.
-The `method` column is "mappo" (level 0) or "mappo_c<level>", so it never collides with the DQN files.
+Example:
+    python src/run_mappo.py --episodes 1 --seed 0 --skip-eval
+    python src/run_mappo.py --episodes 100 --seed 0
 """
-import argparse, datetime, json, os, sys, time
-import numpy as np, pandas as pd, torch
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from env import SumoGridEnv
-import scenarios as S
-from run_experiments import ROOT, EVAL_SEEDS, train_seed, check_seed_split, eval_policy, git_commit
-from agents import mix_rewards
+
+import argparse
+import datetime
+import json
+import os
+import subprocess
+import time
+
+import numpy as np
+import pandas as pd
+import torch
+
+from env_map import SumoMapEnv
+import scenario_gen
 from mappo import MAPPO
 
 
-def train(episodes, seed, level, beta):
-    method = "mappo" if level == 0 else f"mappo_c{level}"
-    tag = f"{method}_s{seed}"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MAP_DIR = os.path.join(ROOT, "maps", "nyc16")
+
+EVAL_SEEDS = [9001, 9002, 9003]
+
+
+def train_seed(seed, episode):
+    return 1000 * seed + episode
+
+
+def check_seed_split(seed, episodes):
+    used = {
+        train_seed(seed, ep) for ep in range(episodes)
+    }
+
+    clash = used.intersection(EVAL_SEEDS)
+
+    if clash:
+        raise ValueError(
+            f"Training seeds overlap evaluation seeds: {sorted(clash)}"
+        )
+
+
+def git_commit():
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=ROOT,
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except Exception:
+        return "unknown"
+
+
+def evaluate(env, agent, method, training_seed):
+    """Evaluate the trained policy on fixed test seeds."""
+
+    rows = []
+    trace_saved = False
+
+    for scenario in scenario_gen.PATTERNS:
+        for seed in EVAL_SEEDS:
+
+            obs = env.reset(scenario=scenario, seed=seed)
+            done = False
+            trace = []
+
+            while not done:
+                actions = agent.act(
+                    obs,
+                    explore=False,
+                    env=env,
+                )
+
+                obs, rewards, done, info = env.step(actions)
+
+                if scenario == "rush_hour" and seed == EVAL_SEEDS[0]:
+                    trace.append({
+                        "time": int(info["time"]),
+                        "queue": info["queue"],
+                        "phase": info["phase"],
+                    })
+
+            metrics = env.metrics()
+
+            rows.append({
+                "method": method,
+                "train_seed": training_seed,
+                "scenario": scenario,
+                "eval_seed": seed,
+                **{
+                    key: float(value)
+                    for key, value in metrics.items()
+                },
+            })
+
+            if trace and not trace_saved:
+                trace_path = os.path.join(
+                    ROOT,
+                    "traces",
+                    f"{method}_s{training_seed}.json",
+                )
+
+                with open(trace_path, "w") as file:
+                    json.dump({
+                        "method": method,
+                        "scenario": scenario,
+                        "eval_seed": seed,
+                        "agents": env.agents,
+                        "steps": trace,
+                    }, file, indent=2)
+
+                trace_saved = True
+
+            print(
+                f"[{method}] evaluation "
+                f"{scenario:10s} seed={seed} "
+                f"avg_wait={metrics['avg_wait_s']:.2f} "
+                f"avg_queue={metrics['avg_queue']:.2f}",
+                flush=True,
+            )
+
+    return rows
+
+def train(episodes, seed, skip_eval=False, reward_mode="queue"):
+
+    if not os.path.isdir(MAP_DIR):
+        raise FileNotFoundError(
+            f"Map directory not found: {MAP_DIR}"
+        )
+
+    if episodes <= 0:
+        raise ValueError("episodes must be greater than zero.")
+
     check_seed_split(seed, episodes)
-    for d in ("results", "models", "traces"):
-        os.makedirs(os.path.join(ROOT, d), exist_ok=True)
-    np.random.seed(seed); torch.manual_seed(seed)
-    env = SumoGridEnv(comm_level=0)
-    agent = MAPPO(env, level=level)
-    curve, t0 = [], time.time()
-    for ep in range(episodes):
-        scn = S.SCENARIOS[ep % len(S.SCENARIOS)]
-        obs = env.reset(scn, train_seed(seed, ep)); done, ret = False, 0.0
-        while not done:
-            act = agent.act(obs, explore=True)
-            obs2, r, done, _ = env.step(act)
-            agent.store(mix_rewards(env, r, beta))
-            ret += np.mean(list(r.values())); obs = obs2          # return logged on the raw reward
-        st = agent.update(obs)                                    # time-limit end -> bootstrap from last obs
-        m = env.metrics()
-        curve.append(dict(episode=ep, scenario=scn, ret=ret, avg_queue=float(m["avg_queue"]),
-                          avg_wait_s=float(m["avg_wait_s"]), **st))
-        print(f"[{method} s{seed}] ep {ep+1}/{episodes} {scn:10s} return={ret:8.1f} avg_wait={m['avg_wait_s']:.1f} "
-              f"ent={st['entropy']:.2f} ({time.time()-t0:.0f}s)", flush=True)
-    pd.DataFrame(curve).to_csv(os.path.join(ROOT, "results", f"curve_{tag}.csv"), index=False)
-    torch.save(agent.state_dict(), os.path.join(ROOT, "models", f"{tag}.pt"))
-    train_time = time.time() - t0
-    rows = eval_policy(method, env, lambda o: agent.act(o, explore=False), train_seed=seed)
-    env.close()
-    pd.DataFrame(rows).to_csv(os.path.join(ROOT, "results", f"eval_{tag}.csv"), index=False)
-    settings = dict(method=method, seed=seed, episodes=episodes, comm_level=level, reward_mix_beta=beta,
-                    train_seed_formula="1000*seed+episode", eval_seeds=EVAL_SEEDS, scenarios=list(S.SCENARIOS),
-                    **agent.hyperparams(), git_commit=git_commit(), train_seconds=round(train_time),
-                    finished=datetime.datetime.now().isoformat(timespec="seconds"))
-    json.dump(settings, open(os.path.join(ROOT, "results", f"settings_{tag}.json"), "w"), indent=2)
-    print(f"[{method} s{seed}] done in {time.time()-t0:.0f}s", flush=True)
+
+    for folder in ("results", "models", "traces"):
+        os.makedirs(os.path.join(ROOT, folder), exist_ok=True)
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    method = "mappo" if reward_mode == "queue" else "mappo_pressure"
+    tag = f"{method}_s{seed}"
+
+    env = SumoMapEnv(MAP_DIR, reward_mode=reward_mode)
+
+    agent = MAPPO(
+        env,
+        level=0,
+        max_lanes=10,
+    )
+
+    curve = []
+    start_time = time.time()
+
+    try:
+        # ---------------- Training ----------------
+
+        for ep in range(episodes):
+
+            scenario = scenario_gen.PATTERNS[
+                ep % len(scenario_gen.PATTERNS)
+            ]
+
+            current_seed = train_seed(seed, ep)
+
+            obs = env.reset(
+                scenario=scenario,
+                seed=current_seed,
+            )
+
+            done = False
+            episode_return = 0.0
+            steps = 0
+
+            while not done:
+
+                actions = agent.act(
+                    obs,
+                    explore=True,
+                    env=env,
+                )
+
+                obs_next, rewards, done, info = env.step(actions)
+
+                agent.store(rewards)
+
+                episode_return += float(
+                    np.mean(list(rewards.values()))
+                )
+
+                obs = obs_next
+                steps += 1
+
+            # Bootstrap the critic from the final observation.
+            update_stats = agent.update(obs)
+
+            metrics = env.metrics()
+
+            row = {
+                "episode": ep,
+                "scenario": scenario,
+                "seed": current_seed,
+                "return": episode_return,
+                "steps": steps,
+                **{
+                    key: float(value)
+                    for key, value in metrics.items()
+                },
+                **update_stats,
+            }
+
+            curve.append(row)
+
+            elapsed = time.time() - start_time
+
+            print(
+                f"[{method} seed={seed}] "
+                f"episode {ep + 1}/{episodes} "
+                f"{scenario:10s} "
+                f"return={episode_return:8.2f} "
+                f"avg_wait={metrics['avg_wait_s']:.2f} "
+                f"avg_queue={metrics['avg_queue']:.2f} "
+                f"entropy={update_stats['entropy']:.3f} "
+                f"time={elapsed:.1f}s",
+                flush=True,
+            )
+
+        # Save training curve and model.
+        curve_path = os.path.join(
+            ROOT, "results", f"curve_{tag}.csv"
+        )
+
+        pd.DataFrame(curve).to_csv(
+            curve_path, index=False
+        )
+
+        model_path = os.path.join(
+            ROOT, "models", f"{tag}.pt"
+        )
+
+        torch.save(agent.state_dict(), model_path)
+
+        train_seconds = time.time() - start_time
+
+        # ---------------- Evaluation ----------------
+
+        if not skip_eval:
+
+            rows = evaluate(
+                env,
+                agent,
+                method,
+                seed,
+            )
+
+            eval_path = os.path.join(
+                ROOT, "results", f"eval_{tag}.csv"
+            )
+
+            pd.DataFrame(rows).to_csv(
+                eval_path, index=False
+            )
+
+        # ---------------- Settings ----------------
+
+        settings = {
+            "method": method,
+            "reward_mode": reward_mode,
+            "seed": seed,
+            "episodes": episodes,
+            "communication_level": 0,
+            "training_seed_formula": "1000*seed+episode",
+            "evaluation_seeds": EVAL_SEEDS,
+            "scenarios": scenario_gen.PATTERNS,
+            "map": "maps/nyc16",
+            "number_of_agents": agent.n_ag,
+            **agent.hyperparams(),
+            "git_commit": git_commit(),
+            "train_seconds": round(train_seconds),
+            "evaluation_skipped": skip_eval,
+            "finished": datetime.datetime.now().isoformat(
+                timespec="seconds"
+            ),
+        }
+
+        settings_path = os.path.join(
+            ROOT, "results", f"settings_{tag}.json"
+        )
+
+        with open(settings_path, "w") as file:
+            json.dump(settings, file, indent=2)
+
+        print("\nTraining completed.")
+        print("Model:", model_path)
+        print("Training results:", curve_path)
+
+        if not skip_eval:
+            print("Evaluation results:", eval_path)
+
+    finally:
+        env.close()
+
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--episodes", type=int, default=100)
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--level", type=int, default=0, choices=[0, 1, 2])
-    ap.add_argument("--beta", type=float, default=0.0)
-    a = ap.parse_args()
-    train(a.episodes, a.seed, a.level, a.beta)
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=100,
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+    )
+
+    parser.add_argument(
+        "--skip-eval",
+        action="store_true",
+        help="Skip evaluation after training.",
+    )
+
+    # Select which reward function MAPPO should use.
+    parser.add_argument(
+        "--reward-mode",
+        choices=["queue", "pressure_delta"],
+        default="queue",
+        help="Reward function: original queue penalty or pressure-aware queue reduction."
+    )
+
+    args = parser.parse_args()
+
+    train(
+        episodes=args.episodes,
+        seed=args.seed,
+        skip_eval=args.skip_eval,
+        reward_mode=args.reward_mode,
+    )

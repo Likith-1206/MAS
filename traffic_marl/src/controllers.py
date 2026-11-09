@@ -1,35 +1,60 @@
-"""Non-learning baselines: fixed-time and Max-Pressure."""
+"""Non-learning baselines for the variable-phase NYC map."""
+
 import numpy as np
-import libsumo as traci
+import traci
 
 
 class FixedTime:
-    """Baseline 1: cycle through the green phases with equal, constant green durations."""
+    """Cycle through each intersection's valid phases."""
+
     name = "fixed_time"
 
     def __init__(self, green_s=30):
         self.green_s = green_s
 
-    def reset(self, env): pass
+    def reset(self, env):
+        pass
 
     def act(self, env, obs):
-        p = (env.t // self.green_s) % env.n_act
-        return {a: int(p) for a in env.agents}
+        actions = {}
+
+        for a in env.agents:
+            n = env.n_acts[a]
+            phase = (env.t // self.green_s) % n
+            actions[a] = int(phase)
+
+        return actions
 
 
 class MaxPressure:
-    """Reference controller (Varaiya 2013): serve the phase with the highest pressure
-    = sum over its movements of (upstream queue - downstream queue). Keeps the current phase on ties."""
+    """Choose the phase with the highest queue pressure."""
+
     name = "max_pressure"
 
-    def reset(self, env): pass
+    def reset(self, env):
+        pass
 
     def act(self, env, obs):
-        acts = {}
+        actions = {}
+
         for a in env.agents:
-            press = []
-            for pl in env.phase_links[a]:
-                press.append(sum(traci.lane.getLastStepHaltingNumber(i) - traci.lane.getLastStepHaltingNumber(o) for i, o in pl))
-            best = int(np.argmax(press))
-            acts[a] = env.cur[a] if press[best] <= press[env.cur[a]] else best
-        return acts
+            pressures = []
+
+            for phase_movements in env.phase_links[a]:
+                pressure = sum(
+                    traci.lane.getLastStepHaltingNumber(in_lane)
+                    - traci.lane.getLastStepHaltingNumber(out_lane)
+                    for in_lane, out_lane in phase_movements
+                )
+                pressures.append(pressure)
+
+            current = env.cur[a]
+            best = int(np.argmax(pressures))
+
+            # Keep the current phase when it ties for maximum pressure.
+            if pressures[best] <= pressures[current]:
+                actions[a] = current
+            else:
+                actions[a] = best
+
+        return actions
